@@ -176,16 +176,16 @@ class RedditServer:
         post = self._build_post(submission)
 
         # Fetch comments
-        comments = self.get_post_comments(post_id, comment_limit)
-        
+        comments = self.get_post_comments(post_id, comment_limit, comment_depth)
+
         return PostDetail(post=post, comments=comments)
 
-    def get_post_comments(self, post_id: str, limit: int = 10) -> list[Comment]:
+    def get_post_comments(self, post_id: str, limit: int = 10, depth: int = 3) -> list[Comment]:
         """Get comments from a post"""
         comments = []
         tree_node = self.client.p.comment_tree.fetch(post_id, sort='top', limit=limit)
         for node in tree_node.children:
-            comment = self._build_comment_tree(node)
+            comment = self._build_comment_tree(node, depth)
             if comment:
                 comments.append(comment)
         return comments
