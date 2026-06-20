@@ -130,7 +130,25 @@ class RedditServer:
 
     def get_subreddit_info(self, subreddit_name: str) -> SubredditInfo:
         """Get information about a subreddit"""
-        subr = self.client.p.subreddit.fetch_by_name(subreddit_name)
+        try:
+            subr = self.client.p.subreddit.fetch_by_name(subreddit_name)
+        except KeyError as exc:
+            # redditwarp's Subreddit model uses bracket access on fields that
+            # Reddit may have removed from the API (e.g. active_user_count).
+            # Fall back to a raw API call to get basic subreddit info.
+            import logging
+            logging.getLogger(__name__).warning(
+                "redditwarp model construction failed for r/%s: %s. "
+                "Using fallback.",
+                subreddit_name, exc,
+            )
+            root = self.client.request('GET', f'/r/{subreddit_name}/about')
+            data = root['data']
+            return SubredditInfo(
+                name=data.get('display_name', subreddit_name),
+                subscriber_count=data.get('subscribers', -1),
+                description=data.get('public_description'),
+            )
         return SubredditInfo(
             name=subr.name,
             subscriber_count=subr.subscriber_count,
