@@ -1,5 +1,5 @@
 # MCP Server Reddit
-[![smithery badge](https://smithery.ai/badge/@Hawstein/mcp-server-reddit)](https://smithery.ai/server/@Hawstein/mcp-server-reddit)
+[![LightNow capabilities](https://lightnow.ai/badge/io.github.Hawstein/mcp-server-reddit)](https://lightnow.ai/servers/io.github.Hawstein/mcp-server-reddit)
 
 A Model Context Protocol server providing access to Reddit public API for LLMs. This server enables LLMs to interact with Reddit's content, including browsing frontpage posts, accessing subreddit information, and reading post comments.
 
