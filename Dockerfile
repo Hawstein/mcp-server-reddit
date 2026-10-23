@@ -6,7 +6,7 @@ FROM python:3.11-slim as builder
 WORKDIR /app
 
 # Install build system
-RUN pip install hatchling
+RUN pip install hatchling build
 
 # Copy project files
 COPY pyproject.toml README.md /app/
@@ -22,7 +22,11 @@ WORKDIR /app
 
 # Install the package
 COPY --from=builder /app/dist/*.whl /app/
-RUN pip install /app/*.whl
+RUN pip install /app/*.whl && rm /app/*.whl
+
+# Run as an unprivileged user
+RUN useradd --create-home --uid 1000 app
+USER app
 
 # Define default command
 ENTRYPOINT ["python", "-m", "mcp_server_reddit"]

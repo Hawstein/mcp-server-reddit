@@ -1,8 +1,12 @@
+import asyncio
 from enum import Enum
 import json
-from typing import Sequence
+import logging
+import re
+from typing import Any, Sequence
 import redditwarp.SYNC
 import redditwarp.models.subreddit
+from redditwarp.http.exceptions import StatusCodeException
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
@@ -22,6 +26,53 @@ if not getattr(redditwarp.models.subreddit.Subreddit.__init__, '_patched', False
 
     _patched_subreddit_init._patched = True
     redditwarp.models.subreddit.Subreddit.__init__ = _patched_subreddit_init
+
+
+logger = logging.getLogger(__name__)
+
+# Reddit's own naming rules. Anything else is rejected before it reaches redditwarp,
+# which interpolates names and IDs into URL paths unencoded (so '../' or '?' would
+# otherwise steer the request to a different endpoint).
+SUBREDDIT_NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_]{1,20}$')
+POST_ID_RE = re.compile(r'^[a-z0-9]{1,13}$')
+TOP_TIME_FILTERS = ("", "hour", "day", "week", "month", "year", "all")
+
+
+class InvalidArgument(ValueError):
+    """A tool argument failed validation; its message is safe to show the caller."""
+
+
+def _require_subreddit_name(arguments: dict) -> str:
+    value = arguments.get("subreddit_name")
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidArgument("Missing required argument: subreddit_name")
+    name = value.strip().removeprefix("/").removeprefix("r/")
+    if not SUBREDDIT_NAME_RE.match(name):
+        raise InvalidArgument(f"Invalid subreddit name: {value!r}")
+    return name
+
+
+def _require_post_id(arguments: dict) -> str:
+    value = arguments.get("post_id")
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidArgument("Missing required argument: post_id")
+    post_id = value.strip().lower().removeprefix("t3_")
+    if not POST_ID_RE.match(post_id):
+        raise InvalidArgument(f"Invalid post ID: {value!r}")
+    return post_id
+
+
+def _int_arg(arguments: dict, key: str, default: int, minimum: int, maximum: int) -> int:
+    # The JSON schema bounds aren't enforced by every MCP SDK version, and redditwarp
+    # treats a None amount as "fetch everything", so check them here.
+    value = arguments.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise InvalidArgument(f"{key} must be an integer")
+    if not minimum <= value <= maximum:
+        raise InvalidArgument(f"{key} must be between {minimum} and {maximum}")
+    return value
 
 
 class PostType(str, Enum):
@@ -99,7 +150,7 @@ class RedditServer:
     def _get_post_content(self, submission) -> str | None:
         """Helper method to extract post content based on type"""
         if isinstance(submission, redditwarp.models.submission_SYNC.LinkPost):
-            return submission.permalink
+            return submission.link
         elif isinstance(submission, redditwarp.models.submission_SYNC.TextPost):
             return submission.body
         elif isinstance(submission, redditwarp.models.submission_SYNC.GalleryPost):
@@ -137,7 +188,7 @@ class RedditServer:
             description=subr.public_description
         )
 
-    def _build_comment_tree(self, node, depth: int = 3) -> Comment | None:
+    def _build_comment_tree(self, node, depth: int) -> Comment | None:
         """Helper method to recursively build comment tree"""
         if depth <= 0 or not node:
             return None
@@ -187,20 +238,24 @@ class RedditServer:
 
     def get_post_content(self, post_id: str, comment_limit: int = 10, comment_depth: int = 3) -> PostDetail:
         """Get detailed content of a specific post including comments"""
-        submission = self.client.p.submission.fetch(post_id)
-        post = self._build_post(submission)
-
-        # Fetch comments
-        comments = self.get_post_comments(post_id, comment_limit)
-        
+        # The comment tree response already includes the submission, so one request covers both.
+        tree_node = self._fetch_comment_tree(post_id, comment_limit, comment_depth)
+        post = self._build_post(tree_node.value)
+        comments = self._build_comments(tree_node, comment_depth)
         return PostDetail(post=post, comments=comments)
 
-    def get_post_comments(self, post_id: str, limit: int = 10) -> list[Comment]:
+    def get_post_comments(self, post_id: str, limit: int = 10, depth: int = 3) -> list[Comment]:
         """Get comments from a post"""
+        tree_node = self._fetch_comment_tree(post_id, limit, depth)
+        return self._build_comments(tree_node, depth)
+
+    def _fetch_comment_tree(self, post_id: str, limit: int, depth: int):
+        return self.client.p.comment_tree.fetch(post_id, sort='top', limit=limit, depth=depth)
+
+    def _build_comments(self, tree_node, depth: int) -> list[Comment]:
         comments = []
-        tree_node = self.client.p.comment_tree.fetch(post_id, sort='top', limit=limit)
         for node in tree_node.children:
-            comment = self._build_comment_tree(node)
+            comment = self._build_comment_tree(node, depth)
             if comment:
                 comments.append(comment)
         return comments
@@ -209,6 +264,13 @@ class RedditServer:
 async def serve() -> None:
     server = Server("mcp-reddit")
     reddit_server = RedditServer()
+    # redditwarp's SYNC client blocks, so run it off the event loop. The lock keeps
+    # calls on the shared client sequential, as they were before.
+    reddit_lock = asyncio.Lock()
+
+    async def run_blocking(func, *args: Any) -> Any:
+        async with reddit_lock:
+            return await asyncio.to_thread(func, *args)
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -390,71 +452,73 @@ async def serve() -> None:
         name: str, arguments: dict
     ) -> Sequence[TextContent | ImageContent | EmbeddedResource]:
         """Handle tool calls for Reddit API."""
+        arguments = arguments or {}
         try:
             match name:
                 case RedditTools.GET_FRONTPAGE_POSTS.value:
-                    limit = arguments.get("limit", 10)
-                    result = reddit_server.get_frontpage_posts(limit)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    result = await run_blocking(reddit_server.get_frontpage_posts, limit)
 
                 case RedditTools.GET_SUBREDDIT_INFO.value:
-                    subreddit_name = arguments.get("subreddit_name")
-                    if not subreddit_name:
-                        raise ValueError("Missing required argument: subreddit_name")
-                    result = reddit_server.get_subreddit_info(subreddit_name)
+                    subreddit_name = _require_subreddit_name(arguments)
+                    result = await run_blocking(reddit_server.get_subreddit_info, subreddit_name)
 
                 case RedditTools.GET_SUBREDDIT_HOT_POSTS.value:
-                    subreddit_name = arguments.get("subreddit_name")
-                    if not subreddit_name:
-                        raise ValueError("Missing required argument: subreddit_name")
-                    limit = arguments.get("limit", 10)
-                    result = reddit_server.get_subreddit_hot_posts(subreddit_name, limit)
+                    subreddit_name = _require_subreddit_name(arguments)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    result = await run_blocking(reddit_server.get_subreddit_hot_posts, subreddit_name, limit)
 
                 case RedditTools.GET_SUBREDDIT_NEW_POSTS.value:
-                    subreddit_name = arguments.get("subreddit_name")
-                    if not subreddit_name:
-                        raise ValueError("Missing required argument: subreddit_name")
-                    limit = arguments.get("limit", 10)
-                    result = reddit_server.get_subreddit_new_posts(subreddit_name, limit)
+                    subreddit_name = _require_subreddit_name(arguments)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    result = await run_blocking(reddit_server.get_subreddit_new_posts, subreddit_name, limit)
 
                 case RedditTools.GET_SUBREDDIT_TOP_POSTS.value:
-                    subreddit_name = arguments.get("subreddit_name")
-                    if not subreddit_name:
-                        raise ValueError("Missing required argument: subreddit_name")
-                    limit = arguments.get("limit", 10)
-                    time = arguments.get("time", "")
-                    result = reddit_server.get_subreddit_top_posts(subreddit_name, limit, time)
+                    subreddit_name = _require_subreddit_name(arguments)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    time = arguments.get("time") or ""
+                    if time not in TOP_TIME_FILTERS:
+                        raise InvalidArgument(f"time must be one of: {', '.join(t for t in TOP_TIME_FILTERS if t)}")
+                    result = await run_blocking(reddit_server.get_subreddit_top_posts, subreddit_name, limit, time)
 
                 case RedditTools.GET_SUBREDDIT_RISING_POSTS.value:
-                    subreddit_name = arguments.get("subreddit_name")
-                    if not subreddit_name:
-                        raise ValueError("Missing required argument: subreddit_name")
-                    limit = arguments.get("limit", 10)
-                    result = reddit_server.get_subreddit_rising_posts(subreddit_name, limit)
+                    subreddit_name = _require_subreddit_name(arguments)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    result = await run_blocking(reddit_server.get_subreddit_rising_posts, subreddit_name, limit)
 
                 case RedditTools.GET_POST_CONTENT.value:
-                    post_id = arguments.get("post_id")
-                    if not post_id:
-                        raise ValueError("Missing required argument: post_id")
-                    comment_limit = arguments.get("comment_limit", 10)
-                    comment_depth = arguments.get("comment_depth", 3)
-                    result = reddit_server.get_post_content(post_id, comment_limit, comment_depth)
+                    post_id = _require_post_id(arguments)
+                    comment_limit = _int_arg(arguments, "comment_limit", 10, 1, 100)
+                    comment_depth = _int_arg(arguments, "comment_depth", 3, 1, 10)
+                    result = await run_blocking(reddit_server.get_post_content, post_id, comment_limit, comment_depth)
 
                 case RedditTools.GET_POST_COMMENTS.value:
-                    post_id = arguments.get("post_id")
-                    if not post_id:
-                        raise ValueError("Missing required argument: post_id")
-                    limit = arguments.get("limit", 10)
-                    result = reddit_server.get_post_comments(post_id, limit)
+                    post_id = _require_post_id(arguments)
+                    limit = _int_arg(arguments, "limit", 10, 1, 100)
+                    result = await run_blocking(reddit_server.get_post_comments, post_id, limit)
 
                 case _:
-                    raise ValueError(f"Unknown tool: {name}")
+                    raise InvalidArgument(f"Unknown tool: {name}")
 
             return [
                 TextContent(type="text", text=json.dumps(result, default=lambda x: x.model_dump(), indent=2))
             ]
 
+        except InvalidArgument as e:
+            # Our own argument validation: the message is safe and useful to show as-is.
+            raise ValueError(f"Error processing mcp-server-reddit query: {e}") from e
+        except StatusCodeException as e:
+            logger.exception("Reddit request failed for tool %s", name)
+            raise ValueError(
+                f"Error processing mcp-server-reddit query: Reddit returned HTTP {e.status_code}"
+            ) from e
         except Exception as e:
-            raise ValueError(f"Error processing mcp-server-reddit query: {str(e)}")
+            # Don't forward raw library errors (URLs, response fragments) to the model;
+            # the full traceback goes to the server log instead.
+            logger.exception("Unexpected error in tool %s", name)
+            raise ValueError(
+                f"Error processing mcp-server-reddit query: unexpected {type(e).__name__}"
+            ) from e
 
     options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
